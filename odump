@@ -1,0 +1,530 @@
+#!/usr/bin/env bash
+#
+# odump — Odoo Universal Database Backup CLI
+# ------------------------------------------
+# Genera backups de Odoo vía HTTP (/web/database/backup) compatible con:
+#   1. Contenedores Docker y Podman (autodescubrimiento de IP/puerto y odoo.conf).
+#   2. Instalaciones locales / bare-metal (localhost:8069 o custom conf).
+#   3. Servidores remotos vía Web (URLs directas https://... o host:puerto).
+#
+# Principios: KISS, Fail Fast, Return Early, POLS.
+#
+set -euo pipefail
+
+# ==============================================================================
+# Ayuda y Documentación
+# ==============================================================================
+usage() {
+    cat <<EOF
+Uso: $(basename "$0") [target] [opciones]
+
+Target (opcional):
+  <nombre_contenedor>        Nombre o ID en Docker / Podman (ej. odoo-prod).
+  <url_o_host>               URL remota (ej. https://odoo.empresa.com) o host:puerto.
+  (sin target)               Por defecto conecta a http://localhost:8069.
+
+Opciones:
+  -d, --database <nombre>    Nombre de la base de datos a respaldar.
+                             (Se autodetecta si solo existe una o está en conf).
+  -p, --password <pwd>       Master password de Odoo (admin_passwd).
+                             (También vía variable de entorno ODOO_MASTER_PASSWD).
+  -c, --config <ruta>        Ruta a odoo.conf (local o dentro del contenedor).
+  -o, --output <archivo>     Ruta o nombre personalizado para el archivo de salida.
+  --zip                      Backup completo con filestore en formato .zip.
+                             (Por defecto se genera .dump solo SQL).
+  -k, --insecure             Permite conexiones HTTPS sin verificar certificado SSL.
+  -h, --help                 Muestra esta ayuda.
+
+Ejemplos:
+  # 1. Local (instancia en localhost:8069)
+  $(basename "$0") -d mi_db
+
+  # 2. Contenedor Docker o Podman
+  $(basename "$0") mi-contenedor-odoo --zip
+
+  # 3. Servidor Remoto Web (sin acceso a consola ni archivos)
+  $(basename "$0") https://odoo.empresa.com -d prod_db -p SuperSecretPwd --zip
+
+  # 4. Uso en CI/CD o Cron
+  ODOO_MASTER_PASSWD="secret" $(basename "$0") :8069 -d test_db
+EOF
+}
+
+# Salida rápida si se solicita ayuda
+for arg in "$@"; do
+    if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+        usage
+        exit 0
+    fi
+done
+
+# ==============================================================================
+# Dependencias Base
+# ==============================================================================
+if ! command -v curl >/dev/null 2>&1; then
+    echo "ERROR: 'curl' es requerido y no está instalado." >&2
+    exit 1
+fi
+
+# ==============================================================================
+# Variables de Estado y Configuración
+# ==============================================================================
+RAW_TARGET=""
+TARGET_KIND="local"          # local | container | url
+TARGET_LABEL="local"
+BASE_URL="http://localhost:8069"
+
+CONTAINER_ENGINE=""          # docker | podman
+ODOO_CONF_RAW=""
+
+DB_NAME="${ODOO_DB_NAME:-}"
+MASTER_PWD="${ODOO_MASTER_PASSWD:-}"
+CUSTOM_CONF_PATH=""
+OUTPUT_FILE_OVERRIDE=""
+BACKUP_FORMAT="dump"         # dump | zip
+CURL_INSECURE_FLAG=""
+
+# ==============================================================================
+# Parseo de Argumentos CLI
+# ==============================================================================
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--database)
+            [[ -z "${2:-}" ]] && { echo "ERROR: $1 requiere un nombre de base de datos." >&2; exit 1; }
+            DB_NAME="$2"
+            shift 2
+            ;;
+        -p|--password)
+            [[ -z "${2:-}" ]] && { echo "ERROR: $1 requiere un password." >&2; exit 1; }
+            MASTER_PWD="$2"
+            shift 2
+            ;;
+        -c|--config)
+            [[ -z "${2:-}" ]] && { echo "ERROR: $1 requiere una ruta de archivo." >&2; exit 1; }
+            CUSTOM_CONF_PATH="$2"
+            shift 2
+            ;;
+        -o|--output)
+            [[ -z "${2:-}" ]] && { echo "ERROR: $1 requiere una ruta de salida." >&2; exit 1; }
+            OUTPUT_FILE_OVERRIDE="$2"
+            shift 2
+            ;;
+        -k|--insecure)
+            CURL_INSECURE_FLAG="-k"
+            shift
+            ;;
+        --zip)
+            BACKUP_FORMAT="zip"
+            shift
+            ;;
+        -*)
+            echo "ERROR: opción no reconocida '$1'." >&2
+            usage
+            exit 1
+            ;;
+        *)
+            if [[ -z "$RAW_TARGET" ]]; then
+                RAW_TARGET="$1"
+                shift
+            else
+                echo "ERROR: argumento inesperado '$1'." >&2
+                usage
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+# ==============================================================================
+# Detección de Motor de Contenedores (Podman / Docker)
+# ==============================================================================
+detect_container_engine() {
+    if command -v podman >/dev/null 2>&1; then
+        CONTAINER_ENGINE="podman"
+    elif command -v docker >/dev/null 2>&1; then
+        CONTAINER_ENGINE="docker"
+    fi
+}
+
+is_container() {
+    local name="$1"
+    [[ -z "$CONTAINER_ENGINE" ]] && return 1
+    $CONTAINER_ENGINE inspect "$name" >/dev/null 2>&1
+}
+
+# ==============================================================================
+# Resolución de Target y BASE_URL
+# ==============================================================================
+detect_container_engine
+
+if [[ -z "$RAW_TARGET" ]]; then
+    TARGET_KIND="local"
+    TARGET_LABEL="localhost"
+    BASE_URL="http://localhost:8069"
+
+elif [[ "$RAW_TARGET" =~ ^https?:// ]]; then
+    TARGET_KIND="url"
+    BASE_URL="${RAW_TARGET%/}"
+    # Extraer host limpio para el nombre de archivo
+    TARGET_LABEL="$(echo "$BASE_URL" | sed -E 's~https?://~~; s~[:/].*~~')"
+
+elif [[ "$RAW_TARGET" =~ ^:([0-9]+)$ ]]; then
+    TARGET_KIND="url"
+    TARGET_LABEL="localhost"
+    BASE_URL="http://localhost:${BASH_REMATCH[1]}"
+
+elif [[ "$RAW_TARGET" =~ ^([^:]+):([0-9]+)$ ]]; then
+    TARGET_KIND="url"
+    TARGET_LABEL="${BASH_REMATCH[1]}"
+    BASE_URL="http://${RAW_TARGET}"
+
+elif is_container "$RAW_TARGET"; then
+    TARGET_KIND="container"
+    TARGET_LABEL="$RAW_TARGET"
+
+    # Verificar que el contenedor esté corriendo
+    local_running="$($CONTAINER_ENGINE inspect -f '{{.State.Running}}' "$RAW_TARGET" 2>/dev/null || true)"
+    if [[ "$local_running" != "true" ]]; then
+        echo "ERROR: el contenedor '$RAW_TARGET' no está en ejecución." >&2
+        exit 1
+    fi
+
+    # 1. Intentar puerto mapeado al host
+    host_port="$($CONTAINER_ENGINE port "$RAW_TARGET" 8069/tcp 2>/dev/null | awk -F: '{print $NF}' | head -n1 || true)"
+    if [[ -n "$host_port" ]]; then
+        BASE_URL="http://localhost:${host_port}"
+    else
+        # 2. Si no hay mapeo al host, conectar por la IP interna del contenedor
+        container_ip="$($CONTAINER_ENGINE inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$RAW_TARGET" 2>/dev/null || true)"
+        if [[ -n "$container_ip" ]]; then
+            BASE_URL="http://${container_ip}:8069"
+        else
+            echo "ERROR: no se pudo obtener puerto mapeado ni IP interna para '$RAW_TARGET'." >&2
+            exit 1
+        fi
+    fi
+else
+    # Si no es contenedor ni URL explícita, asumimos host directo en puerto 8069
+    TARGET_KIND="url"
+    TARGET_LABEL="$RAW_TARGET"
+    BASE_URL="http://${RAW_TARGET}:8069"
+fi
+
+echo "Modo: ${TARGET_KIND^^} | Target: ${BASE_URL}"
+
+# ==============================================================================
+# Lectura y Parseo de odoo.conf (Local / Contenedor)
+# ==============================================================================
+read_odoo_conf() {
+    local candidates=()
+    if [[ -n "$CUSTOM_CONF_PATH" ]]; then
+        candidates=("$CUSTOM_CONF_PATH")
+    elif [[ "$TARGET_KIND" == "container" ]]; then
+        candidates=("/etc/odoo/odoo.conf" "/etc/odoo.conf" "/conf/odoo.conf")
+    elif [[ "$TARGET_KIND" == "local" ]]; then
+        candidates=("conf/odoo.conf" "./odoo.conf" "/etc/odoo/odoo.conf" "$HOME/.odoorc")
+    fi
+
+    for conf in "${candidates[@]}"; do
+        [[ -z "$conf" ]] && continue
+        if [[ "$TARGET_KIND" == "container" ]]; then
+            local content
+            content="$($CONTAINER_ENGINE exec "$RAW_TARGET" cat "$conf" 2>/dev/null || true)"
+            if [[ -n "$content" ]]; then
+                ODOO_CONF_RAW="$content"
+                return 0
+            fi
+        elif [[ "$TARGET_KIND" == "local" && -f "$conf" ]]; then
+            ODOO_CONF_RAW="$(cat "$conf" 2>/dev/null || true)"
+            [[ -n "$ODOO_CONF_RAW" ]] && return 0
+        fi
+    done
+    return 1
+}
+
+ini_get() {
+    local key="$1"
+    [[ -z "$ODOO_CONF_RAW" ]] && return 0
+    printf '%s\n' "$ODOO_CONF_RAW" | awk -v k="$key" '
+        BEGIN { IGNORECASE=1 }
+        /^[[:space:]]*[;#]/ { next }
+        /^[[:space:]]*\[/ { next }
+        tolower($1) == tolower(k) {
+            sub(/^[^=]*=[[:space:]]*/, "", $0)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+            gsub(/^["'"'"']|["'"'"']$/, "", $0)
+            print
+            exit
+        }
+    '
+}
+
+read_odoo_conf || true
+
+# ==============================================================================
+# Resolución de Master Password
+# ==============================================================================
+if [[ -z "$MASTER_PWD" ]]; then
+    MASTER_PWD="$(ini_get admin_passwd)"
+fi
+
+if [[ -z "$MASTER_PWD" ]]; then
+    if [[ -t 0 ]]; then
+        read -r -s -p "Introduce el Master Password (admin_passwd): " MASTER_PWD
+        echo ""
+    fi
+fi
+
+if [[ -z "$MASTER_PWD" ]]; then
+    echo "ERROR: se requiere el Master Password de Odoo." >&2
+    echo "Proporciónalo con -p <password> o con la variable ODOO_MASTER_PASSWD." >&2
+    exit 1
+fi
+
+# ==============================================================================
+# Resolución de Base de Datos
+# ==============================================================================
+if [[ -z "$DB_NAME" ]]; then
+    DB_NAME="$(ini_get db_name)"
+fi
+
+if [[ -z "$DB_NAME" ]]; then
+    echo "Consultando lista de bases de datos en ${BASE_URL}/web/database/list..."
+    DB_JSON="$(curl -fsS ${CURL_INSECURE_FLAG} --max-time 10 "${BASE_URL}/web/database/list" 2>/dev/null || true)"
+    
+    # Extraer bases limpias del JSON ["db1", "db2"]
+    DB_LIST=()
+    if [[ -n "$DB_JSON" ]]; then
+        while IFS= read -r db_item; do
+            [[ -n "$db_item" ]] && DB_LIST+=("$db_item")
+        done < <(echo "$DB_JSON" | tr -d '[]"' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d')
+    fi
+
+    # Si falló la lista vía HTTP y estamos en un contenedor, consultamos directamente por Python
+    if [[ ${#DB_LIST[@]} -eq 0 && "$TARGET_KIND" == "container" ]]; then
+        local_db_out="$($CONTAINER_ENGINE exec "$RAW_TARGET" python3 -c "
+import os, sys, odoo
+from odoo.tools import config
+args = []
+conf = '${CUSTOM_CONF_PATH}'
+if conf and os.path.isfile(conf):
+    args.extend(['-c', conf])
+else:
+    for c in ['/etc/odoo/odoo.conf', '/etc/odoo.conf', '/conf/odoo.conf', '/var/lib/odoo/.odoorc']:
+        if os.path.isfile(c):
+            args.extend(['-c', c])
+            break
+try:
+    with open('/proc/1/cmdline', 'rb') as f:
+        p1_raw = f.read().decode('utf-8', errors='ignore').split('\x00')
+        p1_args = [x for x in p1_raw if x]
+        for idx, item in enumerate(p1_args):
+            if item.startswith('-'):
+                args.extend(p1_args[idx:])
+                break
+except Exception:
+    pass
+config.parse_config(args)
+if not config.get('db_host'):
+    config['db_host'] = os.environ.get('HOST') or os.environ.get('PGHOST') or os.environ.get('DB_PORT_5432_TCP_ADDR') or False
+if not config.get('db_port'):
+    config['db_port'] = os.environ.get('PORT') or os.environ.get('PGPORT') or 5432
+if not config.get('db_user'):
+    config['db_user'] = os.environ.get('USER') or os.environ.get('PGUSER') or 'odoo'
+if not config.get('db_password'):
+    config['db_password'] = os.environ.get('PASSWORD') or os.environ.get('PGPASSWORD') or False
+print('\n'.join(odoo.service.db.list_dbs(True)))
+" 2>/dev/null || true)"
+        if [[ -n "$local_db_out" ]]; then
+            while IFS= read -r db_item; do
+                [[ -n "$db_item" ]] && DB_LIST+=("$db_item")
+            done <<< "$local_db_out"
+        fi
+    fi
+
+    # Si hay exactamente 1 base de datos, autoseleccionar
+    if [[ ${#DB_LIST[@]} -eq 1 ]]; then
+        DB_NAME="${DB_LIST[0]}"
+        echo "Autodetectada única base de datos disponible: '${DB_NAME}'"
+    elif [[ ${#DB_LIST[@]} -gt 1 ]]; then
+        echo "Bases de datos encontradas:" >&2
+        for d in "${DB_LIST[@]}"; do
+            echo "  - $d" >&2
+        done
+        echo "ERROR: especifica cuál respaldar usando: -d <db_name>" >&2
+        exit 1
+    else
+        echo "ERROR: no se pudo detectar el nombre de la base de datos." >&2
+        echo "Usa: -d <db_name>" >&2
+        exit 1
+    fi
+fi
+
+# ==============================================================================
+# Preparación del Archivo de Salida
+# ==============================================================================
+if [[ -n "$OUTPUT_FILE_OVERRIDE" ]]; then
+    OUTPUT_FILE="$OUTPUT_FILE_OVERRIDE"
+else
+    DATETIME="$(date +%Y%m%d-%H%M%S)"
+    OUTPUT_FILE="${TARGET_LABEL}-${DB_NAME}-backup-${DATETIME}.${BACKUP_FORMAT}"
+fi
+
+# ==============================================================================
+# Funciones Auxiliares de Ejecución y Diagnóstico
+# ==============================================================================
+extract_html_error() {
+    local file="$1"
+    local msg=""
+    # 1. Buscar en tags alert (Bootstrap / Odoo QWeb)
+    msg="$(grep -oE '<div[^>]*class="[^"]*alert[^"]*"[^>]*>[^<]+</div>' "$file" | sed -E 's/<[^>]+>//g' | head -n1 || true)"
+    if [[ -z "$msg" ]]; then
+        # 2. Buscar frases conocidas de Odoo
+        msg="$(grep -oE '(The database manager has been disabled[^<]*|Database [^<]*|Access Denied[^<]*)' "$file" | head -n1 || true)"
+    fi
+    echo "$msg"
+}
+
+backup_via_container_cli() {
+    echo "Ejecutando backup nativo directo en el contenedor '$RAW_TARGET' vía $CONTAINER_ENGINE..."
+    
+    local py_script
+    py_script="
+import sys, os
+try:
+    import odoo
+    from odoo.tools import config
+
+    # 1. Cargar archivo de configuración si existe
+    conf = '${CUSTOM_CONF_PATH}'
+    args = []
+    if conf and os.path.isfile(conf):
+        args.extend(['-c', conf])
+    else:
+        for c in ['/etc/odoo/odoo.conf', '/etc/odoo.conf', '/conf/odoo.conf', '/var/lib/odoo/.odoorc']:
+            if os.path.isfile(c):
+                args.extend(['-c', c])
+                break
+
+    # 2. Heredar argumentos del proceso principal de Odoo (PID 1) si están disponibles
+    try:
+        with open('/proc/1/cmdline', 'rb') as f:
+            p1_raw = f.read().decode('utf-8', errors='ignore').split('\x00')
+            p1_args = [x for x in p1_raw if x]
+            for idx, item in enumerate(p1_args):
+                if item.startswith('-'):
+                    args.extend(p1_args[idx:])
+                    break
+    except Exception:
+        pass
+
+    config.parse_config(args)
+
+    # 3. Fallback a variables de entorno estándar de Docker si no están en config
+    if not config.get('db_host'):
+        config['db_host'] = os.environ.get('HOST') or os.environ.get('PGHOST') or os.environ.get('DB_PORT_5432_TCP_ADDR') or False
+    if not config.get('db_port'):
+        config['db_port'] = os.environ.get('PORT') or os.environ.get('PGPORT') or 5432
+    if not config.get('db_user'):
+        config['db_user'] = os.environ.get('USER') or os.environ.get('PGUSER') or 'odoo'
+    if not config.get('db_password'):
+        config['db_password'] = os.environ.get('PASSWORD') or os.environ.get('PGPASSWORD') or False
+
+    # 4. Asegurar variables de entorno de PostgreSQL para pg_dump
+    if config.get('db_host'):
+        os.environ['PGHOST'] = str(config['db_host'])
+    if config.get('db_port'):
+        os.environ['PGPORT'] = str(config['db_port'])
+    if config.get('db_user'):
+        os.environ['PGUSER'] = str(config['db_user'])
+    if config.get('db_password'):
+        os.environ['PGPASSWORD'] = str(config['db_password'])
+
+    config['list_db'] = True
+    odoo.service.db.dump_db('${DB_NAME}', sys.stdout.buffer, '${BACKUP_FORMAT}')
+except Exception as e:
+    sys.stderr.write(f'ERROR_BACKUP: {e}\n')
+    sys.exit(1)
+"
+    if $CONTAINER_ENGINE exec -i "$RAW_TARGET" python3 -c "$py_script" > "$OUTPUT_FILE"; then
+        if [[ -s "$OUTPUT_FILE" ]]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# ==============================================================================
+# Ejecución del Backup
+# ==============================================================================
+echo "Iniciando descarga de backup para '${DB_NAME}' (${BACKUP_FORMAT}) -> ${OUTPUT_FILE}..."
+
+cleanup_on_failure() {
+    rm -f "$OUTPUT_FILE"
+}
+
+# 1. Intento principal vía HTTP
+HTTP_CODE=$(curl -sS -L ${CURL_INSECURE_FLAG} -o "$OUTPUT_FILE" -w '%{http_code}' --max-time 0 \
+    --data-urlencode "master_pwd=${MASTER_PWD}" \
+    --data-urlencode "name=${DB_NAME}" \
+    --data-urlencode "backup_format=${BACKUP_FORMAT}" \
+    "${BASE_URL}/web/database/backup" 2>/dev/null || echo "000")
+
+# ==============================================================================
+# Validaciones de Integridad y Fallback Inteligente
+# ==============================================================================
+IS_HTML=false
+if [[ "$HTTP_CODE" == "200" && -s "$OUTPUT_FILE" ]]; then
+    if command -v file >/dev/null 2>&1; then
+        if file "$OUTPUT_FILE" | grep -qi 'html'; then
+            IS_HTML=true
+        fi
+    else
+        if head -n 10 "$OUTPUT_FILE" | grep -Eiq '<!DOCTYPE html|<html|<title>'; then
+            IS_HTML=true
+        fi
+    fi
+fi
+
+# Si HTTP falló o devolvió HTML de error:
+if [[ "$HTTP_CODE" != "200" || ! -s "$OUTPUT_FILE" || "$IS_HTML" == "true" ]]; then
+    HTML_ERROR=""
+    if [[ "$IS_HTML" == "true" ]]; then
+        HTML_ERROR="$(extract_html_error "$OUTPUT_FILE")"
+    fi
+    cleanup_on_failure
+
+    # Si estamos en modo CONTAINER, ejecutamos fallback directo por CLI
+    if [[ "$TARGET_KIND" == "container" ]]; then
+        if [[ -n "$HTML_ERROR" ]]; then
+            echo "Aviso HTTP: $HTML_ERROR"
+        fi
+        echo "Activando fallback automático vía contenedor ($CONTAINER_ENGINE exec)..."
+        if backup_via_container_cli; then
+            echo "======================================================================"
+            echo " OK: Backup guardado exitosamente (vía contenedor):"
+            echo " $(pwd)/${OUTPUT_FILE} ($(du -h "$OUTPUT_FILE" 2>/dev/null | awk '{print $1}' || echo "OK"))"
+            echo "======================================================================"
+            exit 0
+        else
+            echo "ERROR: Falló el backup directo dentro del contenedor." >&2
+            cleanup_on_failure
+            exit 1
+        fi
+    fi
+
+    # Si es modo remoto URL y falló:
+    echo "ERROR: No se pudo generar el backup vía HTTP (HTTP ${HTTP_CODE})." >&2
+    if [[ -n "$HTML_ERROR" ]]; then
+        echo "Motivo reportado por Odoo: $HTML_ERROR" >&2
+        if [[ "$HTML_ERROR" =~ "disabled by the administrator" || "$HTML_ERROR" =~ "Access Denied" ]]; then
+            echo "Tip: El servidor remoto tiene 'list_db = False' o el master password es inválido." >&2
+        fi
+    fi
+    exit 1
+fi
+
+echo "======================================================================"
+echo " OK: Backup guardado exitosamente:"
+echo " $(pwd)/${OUTPUT_FILE} ($(du -h "$OUTPUT_FILE" 2>/dev/null | awk '{print $1}' || echo "OK"))"
+echo "======================================================================"
